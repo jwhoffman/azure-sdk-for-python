@@ -1,0 +1,1695 @@
+trigger:
+  branches:
+    include:
+    - main
+    - hotfix/*
+    - release/*
+    - restapi*
+  paths:
+    include:
+    - sdk/template/
+    - scripts/
+pr:
+  branches:
+    include:
+    - main
+    - feature/*
+    - hotfix/*
+    - release/*
+    - restapi*
+  paths:
+    include:
+    - sdk/template/
+stages:
+- stage: Build
+  variables:
+  - name: BuildTargetingStringValue
+    value: $[ coalesce(variables['BuildTargetingString'], 'azure-*') ]
+  jobs:
+  - job: 'Build'
+    timeoutInMinutes: 90
+    variables:
+    - name: PythonVersion
+      value: '3.6'
+    - name: skipComponentGovernanceDetection
+      value: true
+    - name: AzureSDKCondaChannel
+      value: https://azuresdkconda.blob.core.windows.net/channel1/
+    pool:
+      name: azsdk-pool-mms-ubuntu-2004-general
+      vmImage: MMSUbuntu20.04
+    steps:
+    - task: PowerShell@2
+      displayName: Prep template pipeline for release
+      condition: succeeded()
+      inputs:
+        pwsh: true
+        workingDirectory: $(Build.SourcesDirectory)
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/SetTestPipelineVersion.ps1
+        arguments: -BuildID $(Build.BuildId) -PackageName azure-template -ServiceDirectory template
+    - task: PowerShell@2
+      displayName: "Setup Default Branch"
+      inputs:
+        targetType: inline
+        script: >
+          $setDefaultBranch = (git remote show origin | Out-String) -replace "(?ms).*HEAD branch: (\w+).*", '$1'
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Not able to fetch the default branch from git command. Set to main."
+            $setDefaultBranch = 'main'
+          }
+
+          Write-Host "Setting DefaultBranch=$setDefaultBranch"
+
+          Write-Host "##vso[task.setvariable variable=DefaultBranch]$setDefaultBranch"
+        pwsh: true
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        ignoreLASTEXITCODE: true
+    - task: CmdLine@2
+      displayName: 'Tag scheduled builds'
+      condition: and(eq(variables['Build.SourceBranchName'], variables['DefaultBranch']), eq(variables['Build.Reason'],'Schedule'))
+      inputs:
+        script: |
+          echo "##vso[build.addbuildtag]Scheduled"
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 2.7'
+      inputs:
+        versionSpec: '2.7'
+    - task: CmdLine@2
+      displayName: 'Prep Py2 Environment'
+      inputs:
+        script: |
+          pip install -r eng/ci_tools.txt
+    - task: PythonScript@0
+      displayName: 'Generate Python2 Applicable Namespace Packages'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/build_packages.py'
+        arguments: -d "$(Build.ArtifactStagingDirectory)" "$(BuildTargetingStringValue)" --pkgfilter="nspkg" --service=template
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PythonVersion)'
+      inputs:
+        versionSpec: $(PythonVersion)
+    - task: CmdLine@2
+      displayName: 'Prep Environment'
+      inputs:
+        script: |
+          pip install -r eng/ci_tools.txt
+    - task: Powershell@2
+      inputs:
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/Save-Package-Properties.ps1
+        arguments: >
+          -ServiceDirectory template -OutDirectory $(Build.ArtifactStagingDirectory)/PackageInfo
+        pwsh: true
+        workingDirectory: $(Pipeline.Workspace)
+      displayName: Dump Package properties
+      condition: succeeded()
+    - task: PowerShell@2
+      displayName: "Setup Versioning Properties"
+      condition: eq(variables['SetDevVersion'], '')
+      inputs:
+        targetType: inline
+        script: |
+          $setDailyDevBuild = "false"
+          if (('$(Build.Reason)' -eq 'Schedule') -and ('$(System.TeamProject)' -eq 'internal')) {
+            $setDailyDevBuild = "true"
+          }
+          echo "##vso[task.setvariable variable=SetDevVersion]$setDailyDevBuild"
+        pwsh: true
+    - task: PythonScript@0
+      condition: and(succeededOrFailed(), eq(variables['SetDevVersion'],'true'))
+      displayName: "Update package versions for dev build"
+      inputs:
+        scriptPath: 'eng/versioning/version_set_dev.py'
+        arguments: '"$(BuildTargetingStringValue)" --service="template" --build-id="$(Build.BuildNumber)"'
+    - task: PythonScript@0
+      displayName: 'Generate Packages'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/build_packages.py'
+        arguments: -d "$(Build.ArtifactStagingDirectory)" "$(BuildTargetingStringValue)" --service=template --devbuild="$(SetDevVersion)"
+    - task: CmdLine@2
+      displayName: 'Verify Readme'
+      inputs:
+        script: |
+          twine check $(Build.ArtifactStagingDirectory)/**/*.whl
+          twine check $(Build.ArtifactStagingDirectory)/**/*.zip
+    - task: PythonScript@0
+      displayName: 'Generate Docs'
+      condition: and(succeededOrFailed(), True)
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)"  --service="template"  --toxenv=sphinx'
+    - task: PublishPipelineArtifact@1
+      condition: and(succeeded(), true)
+      displayName: Publish packages Artifacts
+      inputs:
+        artifactName: packages
+        path: $(Build.ArtifactStagingDirectory)
+    - task: PublishPipelineArtifact@1
+      condition: failed()
+      displayName: Publish failed packages Artifacts
+      inputs:
+        artifactName: packages-FailedAttempt$(System.JobAttempt)
+        path: $(Build.ArtifactStagingDirectory)
+    - task: PublishPipelineArtifact@1
+      condition: and(succeeded(), True)
+      displayName: Publish documentation Artifacts
+      inputs:
+        artifactName: documentation
+        path: $(Build.SourcesDirectory)/_docs
+    - task: PublishPipelineArtifact@1
+      condition: failed()
+      displayName: Publish failed documentation Artifacts
+      inputs:
+        artifactName: documentation-FailedAttempt$(System.JobAttempt)
+        path: $(Build.SourcesDirectory)/_docs
+    - task: PowerShell@2
+      displayName: Prep template pipeline for release
+      condition: succeeded()
+      inputs:
+        pwsh: true
+        workingDirectory: $(Build.SourcesDirectory)
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/SetTestPipelineVersion.ps1
+        arguments: -BuildID $(Build.BuildId) -PackageName azure-template -ServiceDirectory template
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PythonVersion)'
+      inputs:
+        versionSpec: $(PythonVersion)
+    - task: CmdLine@2
+      displayName: 'Prep Environment'
+      inputs:
+        script: |
+          pip install -r eng/ci_tools.txt
+    - task: PowerShell@2
+      displayName: 'Create Conda Working Directories'
+      inputs:
+        targetType: inline
+        script: |
+          mkdir $(Agent.BuildDirectory)/conda/
+          mkdir $(Agent.BuildDirectory)/conda/output
+          mkdir $(Agent.BuildDirectory)/conda/build
+
+          Write-Host "##vso[task.setvariable variable=conda.output]$(Agent.BuildDirectory)/conda/output"
+          Write-Host "##vso[task.setvariable variable=conda.build]$(Agent.BuildDirectory)/conda/build"
+        pwsh: true
+    - task: PublishPipelineArtifact@1
+      condition: and(succeeded(), true)
+      displayName: Publish conda Artifacts
+      inputs:
+        artifactName: conda
+        path: $(Agent.BuildDirectory)/conda/output
+    - task: PublishPipelineArtifact@1
+      condition: failed()
+      displayName: Publish failed conda Artifacts
+      inputs:
+        artifactName: conda-FailedAttempt$(System.JobAttempt)
+        path: $(Agent.BuildDirectory)/conda/output
+  - job: 'Analyze'
+    condition: and(succeededOrFailed(), ne(variables['Skip.Analyze'], 'true'))
+    variables:
+    - name: PythonVersion
+      value: '3.6'
+    - name: skipComponentGovernanceDetection
+      value: true
+    - name: AzureSDKCondaChannel
+      value: https://azuresdkconda.blob.core.windows.net/channel1/
+    dependsOn:
+    - 'Build'
+    pool:
+      name: azsdk-pool-mms-ubuntu-2004-general
+      vmImage: MMSUbuntu20.04
+    steps:
+    - task: PowerShell@2
+      displayName: "Setup Default Branch"
+      inputs:
+        targetType: inline
+        script: >
+          $setDefaultBranch = (git remote show origin | Out-String) -replace "(?ms).*HEAD branch: (\w+).*", '$1'
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Not able to fetch the default branch from git command. Set to main."
+            $setDefaultBranch = 'main'
+          }
+
+          Write-Host "Setting DefaultBranch=$setDefaultBranch"
+
+          Write-Host "##vso[task.setvariable variable=DefaultBranch]$setDefaultBranch"
+        pwsh: true
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        ignoreLASTEXITCODE: true
+    - task: PowerShell@2
+      displayName: Link verification check
+      condition: succeeded()
+      inputs:
+        pwsh: true
+        workingDirectory: $(System.DefaultWorkingDirectory)/sdk/template
+        filePath: eng/common/scripts/Verify-Links.ps1
+        arguments: '-urls (Get-ChildItem -Path ./ -Recurse -Include *.md) -rootUrl "file://$(System.DefaultWorkingDirectory)/sdk/template" -recursive: $false -ignoreLinksFile $(Build.SourcesDirectory)/eng/ignore-links.txt -branchReplaceRegex "^(${env:SYSTEM_PULLREQUEST_SOURCEREPOSITORYURI}.*/(?:blob|tree)/)$(DefaultBranch)(/.*)$" -branchReplacementName ${env:SYSTEM_PULLREQUEST_SOURCECOMMITID} -devOpsLogging: $true -checkLinkGuidance: $true -inputCacheFile "https://azuresdkartifacts.blob.core.windows.net/verify-links-cache/verify-links-cache.txt"'
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PythonVersion)'
+      condition: succeededOrFailed()
+      inputs:
+        versionSpec: '$(PythonVersion)'
+    - task: PowerShell@2
+      displayName: 'Verify Readmes'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: inline
+        script: |
+          pip install -r eng/ci_tools.txt $(if($IsWindows) {"--user" })
+          ward scan -d $(Build.SourcesDirectory) -c $(Build.SourcesDirectory)/eng/.docsettings.yml
+        pwsh: true
+    - task: PowerShell@2
+      displayName: 'Populate Reports Staging Folder'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: inline
+        script: |
+          mkdir "$(Build.ArtifactStagingDirectory)/reports"
+          Copy-Item -Path "$(Build.SourcesDirectory)/eng/common/InterdependencyGraph.html" -Destination "$(Build.ArtifactStagingDirectory)/reports/InterdependencyGraph.html"
+        pwsh: true
+    - task: PythonScript@0
+      displayName: 'Analyze dependencies'
+      condition: succeededOrFailed()
+      inputs:
+        scriptPath: 'scripts/analyze_deps.py'
+        arguments: '--verbose --out "$(Build.ArtifactStagingDirectory)/reports/dependencies.html" --dump "$(Build.ArtifactStagingDirectory)/reports/data.js"'
+    - task: PowerShell@2
+      displayName: Prep template pipeline for release
+      condition: succeeded()
+      inputs:
+        pwsh: true
+        workingDirectory: $(Build.SourcesDirectory)
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/SetTestPipelineVersion.ps1
+        arguments: -BuildID $(Build.BuildId) -PackageName azure-template -ServiceDirectory template
+    - task: Powershell@2
+      inputs:
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/Verify-ChangeLog.ps1
+        arguments: >
+          -PackageName azure-template -ServiceDirectory template -ForRelease $False
+        pwsh: true
+        workingDirectory: $(Pipeline.Workspace)
+      displayName: Verify ChangeLogEntry for azure-template
+      continueOnError: false
+    - task: PowerShell@2
+      displayName: 'Install Necessary Dependencies'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: inline
+        script: |
+          pip install -r eng/ci_tools.txt $(if($IsWindows) {"--user" })
+        pwsh: true
+    - task: CmdLine@2
+      displayName: Find Invalid Versions
+      condition: succeededOrFailed()
+      inputs:
+        script: >
+          cd eng/versioning
+
+          pip install -r requirements.txt
+
+          python find_invalid_versions.py --always-succeed --service=template
+    - task: PowerShell@2
+      displayName: Check for CRLF Line endings
+      inputs:
+        targetType: inline
+        script: |
+          Get-ChildItem $(Build.SourcesDirectory) -Filter "*.py" |
+          Foreach-Object {
+            if ((Get-Content $_ -Raw) -match "\r\n") {
+              Write-Error "Found CRLF line ending in `$_`"
+            }
+          }
+
+          Get-ChildItem $(Build.SourcesDirectory) -Filter "*.md" |
+          Foreach-Object {
+            if ((Get-Content $_ -Raw) -match "\r\n") {
+              Write-Error "Found CRLF line ending in `$_`"
+            }
+          }
+        pwsh: true
+    - task: PythonScript@0
+      displayName: Analyze Path Lengths
+      inputs:
+        scriptSource: inline
+        script: >
+          # Verifies Length of file path for all files in the SourceDirectory.
+
+          # File paths and directory paths must be less than 260 and 248 characters respectively on windows OS
+
+          # Repo users get a limited number of characters for the repo clone path. As Specified by the BasePathLength parameter.
+
+          # Script makes sure that paths in the repo are less than 260 and 248 for files and directories respectively after adding the BasePathLength.
+
+          import os
+
+          import sys
+
+
+          source_directory = r'$(Build.SourcesDirectory)'
+
+          break_switch = False
+
+          long_file_paths = []
+
+          long_dir_paths = []
+
+
+          def pluralize(string, plural_string, count):
+              return plural_string if count > 1 else string
+
+          print('Analyzing length of paths...')
+
+          for root, dirs, files in os.walk('{0}'.format(source_directory)):
+              for file in files:
+                  file_path = os.path.relpath(os.path.join(root, file), source_directory)
+                  if ((len(file_path) + 49) > 260):
+                      long_file_paths.append(file_path)
+
+                  dir_path = os.path.relpath(root, source_directory)
+                  if ((len(dir_path) + 49) > 248):
+                      long_dir_paths.append(dir_path)
+
+          if (len(long_file_paths) > 0):
+              print('With a base path length of {0} the following file path{1} exceed the allow path length of 260 characters'.format(49, pluralize('', 's', len(long_file_paths))))
+              print(*long_file_paths, sep = "\n")
+              break_switch = True
+
+          if (len(long_dir_paths) > 0):
+              print('With a base path length of {0} the following directory path{1} exceed the allow path length of 248 characters'.format(49, pluralize('', 's', len(long_dir_paths))))
+              print(*long_dir_paths, sep = "\n")
+              break_switch = True
+
+          if break_switch == True:
+              print("Some file paths are too long. Please reduce path lengths")
+              exit(1)
+    - task: ms.vss-governance-buildtask.governance-build-task-component-detection.ComponentGovernanceComponentDetection@0
+      condition: and(succeededOrFailed(), ne(variables['Build.Reason'],'PullRequest'))
+      displayName: 'Component Detection'
+    - task: PythonScript@0
+      displayName: 'Verify sdist'
+      condition: and(succeededOrFailed(), ne(variables['Skip.VerifySdist'],'true'))
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)" --service=template --toxenv=verifysdist'
+    - task: PythonScript@0
+      displayName: 'Verify whl'
+      condition: and(succeededOrFailed(), ne(variables['Skip.VerifyWhl'],'true'))
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)" --service=template --toxenv=verifywhl'
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.7'
+      inputs:
+        versionSpec: '3.7'
+      condition: and(succeededOrFailed(), ne(variables['Skip.MyPy'],'true'))
+    - task: CmdLine@2
+      displayName: 'Prep Environment'
+      condition: and(succeededOrFailed(), ne(variables['Skip.MyPy'],'true'))
+      inputs:
+        script: |
+          pip install -r eng/ci_tools.txt
+    - task: PythonScript@0
+      displayName: 'Run MyPy'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)"  --mark_arg=""  --service="template"  --toxenv="mypy" --disablecov'
+      env: {}
+      condition: and(succeededOrFailed(), ne(variables['Skip.MyPy'],'true'))
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.7'
+      inputs:
+        versionSpec: '3.7'
+      condition: and(succeededOrFailed(), ne(variables['Skip.Pylint'],'true'))
+    - task: CmdLine@2
+      displayName: 'Prep Environment'
+      condition: and(succeededOrFailed(), ne(variables['Skip.Pylint'],'true'))
+      inputs:
+        script: |
+          pip install -r eng/ci_tools.txt
+    - task: PythonScript@0
+      displayName: 'Run Pylint'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)"  --mark_arg=""  --service="template"  --toxenv="lint" --disablecov --filter-type="Omit_management"'
+      env: {}
+      condition: and(succeededOrFailed(), ne(variables['Skip.Pylint'],'true'))
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.7'
+      inputs:
+        versionSpec: '3.7'
+      condition: succeededOrFailed()
+    - task: CmdLine@2
+      displayName: 'Prep Environment'
+      condition: succeededOrFailed()
+      inputs:
+        script: |
+          pip install -r eng/ci_tools.txt
+    - task: PythonScript@0
+      displayName: 'Run Black'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/validate_formatting.py'
+        arguments: --service_directory="template" --validate="True"
+      env: {}
+      condition: and(succeededOrFailed(), ne(variables['Skip.Pylint'],'true'))
+    - task: DownloadPipelineArtifact@2
+      condition: succeededOrFailed()
+      inputs:
+        artifactName: 'packages'
+        targetPath: $(Build.ArtifactStagingDirectory)
+    - task: PythonScript@0
+      displayName: 'Run Api Stub Generation'
+      condition: and(succeededOrFailed(), ne(variables['Skip.ApiStubGen'],'true'))
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)" --wheel_dir="$(Build.ArtifactStagingDirectory)" --mark_arg=""  --service="template"  --toxenv="apistub" --disablecov --filter-type="Omit_management"'
+    - task: PythonScript@0
+      displayName: 'Run Bandit'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)"  --mark_arg=""  --service="template"  --toxenv="bandit" --disablecov --filter-type="Omit_management"'
+      env: {}
+      condition: and(succeededOrFailed(), ne(variables['Skip.Bandit'],'true'))
+    - task: PythonScript@0
+      displayName: 'Run Breaking Changes'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)" --mark_arg="" --service="template" --toxenv="breaking" --disablecov'
+      env: {}
+      condition: and(succeededOrFailed(), ne(variables['Skip.BreakingChanges'],'true'))
+    - task: PowerShell@2
+      displayName: "Setup Default Branch"
+      inputs:
+        targetType: inline
+        script: >
+          $setDefaultBranch = (git remote show origin | Out-String) -replace "(?ms).*HEAD branch: (\w+).*", '$1'
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Not able to fetch the default branch from git command. Set to main."
+            $setDefaultBranch = 'main'
+          }
+
+          Write-Host "Setting DefaultBranch=$setDefaultBranch"
+
+          Write-Host "##vso[task.setvariable variable=DefaultBranch]$setDefaultBranch"
+        pwsh: true
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        ignoreLASTEXITCODE: true
+    - task: Powershell@2
+      inputs:
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/Create-APIReview.ps1
+        arguments: >
+          -ArtifactPath $(Build.ArtifactStagingDirectory) -APIViewUri $(azuresdk-apiview-uri) -APIKey $(azuresdk-apiview-apikey) -APILabel "Auto Review - $(Build.SourceVersion)" -PackageName azure-template -SourceBranch $(Build.SourceBranchName) -DefaultBranch $(DefaultBranch) -ConfigFileDir '$(Build.ArtifactStagingDirectory)/PackageInfo'
+        pwsh: true
+        workingDirectory: $(Pipeline.Workspace)
+      displayName: Create API Review for azure-template
+      condition: and(succeededOrFailed(), ne(variables['Skip.CreateApiReview'], 'true') , ne(variables['Build.Reason'],'PullRequest'), eq(variables['System.TeamProject'], 'internal'))
+    - task: PublishPipelineArtifact@1
+      condition: and(succeeded(), true)
+      displayName: Publish reports Artifacts
+      inputs:
+        artifactName: reports
+        path: $(Build.ArtifactStagingDirectory)/reports
+    - task: PublishPipelineArtifact@1
+      condition: failed()
+      displayName: Publish failed reports Artifacts
+      inputs:
+        artifactName: reports-FailedAttempt$(System.JobAttempt)
+        path: $(Build.ArtifactStagingDirectory)/reports
+  - job: generate_job_matrix
+    variables:
+    - name: displayNameFilter
+      value: $[ coalesce(variables.jobMatrixFilter, '.*') ]
+    pool:
+      name: azsdk-pool-mms-ubuntu-2004-general
+      vmImage: MMSUbuntu20.04
+    dependsOn:
+    - Build
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: false
+      inputs:
+        repository: none
+    - task: PowerShell@2
+      displayName: 'Sparse checkout repositories'
+      inputs:
+        targetType: inline
+        script: >
+          function SparseCheckout([Array]$paths, [Hashtable]$repository)
+
+          {
+              $paths = $paths -Join ' '
+
+              $dir = $repository.WorkingDirectory
+              if (!$dir) {
+                $dir = "./$($repository.Name)"
+              }
+              New-Item $dir -ItemType Directory -Force
+              Push-Location $dir
+
+              if (Test-Path .git/info/sparse-checkout) {
+                $hasInitialized = $true
+                Write-Host "Repository $($repository.Name) has already been initialized. Skipping this step."
+              } else {
+                Write-Host "Repository $($repository.Name) is being initialized."
+
+                Write-Host "git clone --no-checkout --filter=tree:0 git://github.com/$($repository.Name) ."
+                git clone --no-checkout --filter=tree:0 git://github.com/$($repository.Name) .
+
+                Write-Host "git sparse-checkout init"
+                git sparse-checkout init
+
+                Write-Host "git sparse-checkout set '/*' '!/*/' '/eng'"
+                git sparse-checkout set '/*' '!/*/' '/eng'
+              }
+
+              $gitsparsecmd = "git sparse-checkout add $paths"
+              Write-Host $gitsparsecmd
+              Invoke-Expression -Command $gitsparsecmd
+
+              Write-Host "Set sparse checkout paths to:"
+              Get-Content .git/info/sparse-checkout
+
+              # sparse-checkout commands after initial checkout will auto-checkout again
+              if (!$hasInitialized) {
+                Write-Host "git checkout $($repository.Commitish)"
+                git checkout $($repository.Commitish)  # this will use the default branch if repo.Commitish is empty
+              } else {
+                Write-Host "Skipping checkout as repo has already been initialized"
+              }
+
+              Pop-Location
+          }
+
+
+          # Paths may be sourced as a yaml object literal OR a dynamically generated variable json string.
+
+          # If the latter, convertToJson will wrap the 'string' in quotes, so remove them.
+
+          $paths = '[
+            "template"
+          ]'.Trim('"') | ConvertFrom-Json
+
+          # Replace windows backslash paths, as Azure Pipelines default directories are sometimes formatted like 'D:\a\1\s'
+
+          $repositories = '[
+            {
+              "Name": "$(Build.Repository.Name)",
+              "Commitish": "$(Build.SourceVersion)",
+              "WorkingDirectory": "$(System.DefaultWorkingDirectory)"
+            }
+          ]' -replace '\\', '/' | ConvertFrom-Json -AsHashtable
+
+          foreach ($repo in $Repositories) {
+            SparseCheckout $paths $repo
+          }
+        pwsh: true
+        workingDirectory: $(System.DefaultWorkingDirectory)
+    - task: Powershell@2
+      inputs:
+        pwsh: true
+        filePath: eng/common/scripts/job-matrix/Create-JobMatrix.ps1
+        arguments: >
+          -ConfigPath eng/pipelines/templates/stages/platform-matrix.json -Selection sparse -DisplayNameFilter '$(displayNameFilter)' -Filters '','container=^$','SupportedClouds=^$|Public' -Replace '' -NonSparseParameters ''
+      displayName: Generate VM Job Matrix Python_ci_test_base
+      name: generate_vm_job_matrix_Python_ci_test_base
+  - job: ''
+    displayName: 'Test'
+    condition: >
+      and(
+        succeededOrFailed(),
+        ne(variables['Skip.Test'], 'true'),
+        ne(dependencies.generate_job_matrix.outputs['generate_vm_job_matrix_Python_ci_test_base.matrix'], '{}')
+      )
+    timeoutInMinutes: 60
+    dependsOn:
+    - generate_job_matrix
+    strategy:
+      matrix: $[ dependencies.generate_job_matrix.outputs['generate_vm_job_matrix_Python_ci_test_base.matrix'] ]
+    pool:
+      name: $(Pool)
+      vmImage: $(OSVmImage)
+    variables:
+    - name: PythonVersion
+      value: '3.6'
+    - name: skipComponentGovernanceDetection
+      value: true
+    - name: AzureSDKCondaChannel
+      value: https://azuresdkconda.blob.core.windows.net/channel1/
+    - name: InjectedPackages
+      value: ''
+    steps:
+    - task: PowerShell@2
+      displayName: Verify agent OS
+      inputs:
+        pwsh: true
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        filePath: eng/common/scripts/Verify-AgentOS.ps1
+        arguments: >
+          -AgentImage "$(OSVmImage)"
+    - task: CmdLine@2
+      displayName: Bypass local DNS server to workaround issue resolving cognitiveservices names
+      condition: |
+        and(
+          succeededOrFailed(),
+          contains(variables['OSVmImage'], 'ubuntu'),
+          eq(variables['Container'], '')
+        )
+      inputs:
+        script: sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+    - task: PowerShell@2
+      displayName: Prep template pipeline for release
+      condition: succeeded()
+      inputs:
+        pwsh: true
+        workingDirectory: $(Build.SourcesDirectory)
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/SetTestPipelineVersion.ps1
+        arguments: -BuildID $(Build.BuildId) -PackageName azure-template -ServiceDirectory template
+    - task: PythonScript@0
+      displayName: 'Set Tox Environment'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/set_tox_environment.py'
+        arguments: >-
+          --unsupported="$(UnsupportedToxEnvironments)" --override="$(Run.ToxCustomEnvs)" --team-project="$(System.TeamProject)"
+    - task: PowerShell@2
+      inputs:
+        targetType: inline
+        script: |
+          gci -r $(Build.ArtifactStagingDirectory)
+        pwsh: true
+    - task: UsePythonVersion@0
+      displayName: "Use Python 3.8"
+      inputs:
+        versionSpec: 3.8
+    - task: PowerShell@2
+      displayName: Prep Environment
+      inputs:
+        targetType: inline
+        script: |
+          pip install packaging
+        pwsh: true
+    - task: PythonScript@0
+      displayName: Install $(PythonVersion) from Python Manifest If Necessary
+      inputs:
+        scriptPath: 'scripts/devops_tasks/install_python_version.py'
+        arguments: $(PythonVersion) --installer_folder="../_pyinstaller
+    - task: UsePythonVersion@0
+      displayName: "Use Python $(PythonVersion)"
+      inputs:
+        versionSpec: $(PythonVersion)
+    - task: CmdLine@2
+      displayName: 'Prep Environment'
+      inputs:
+        script: |
+          python -m pip install pip==20.1
+          pip install -r eng/ci_tools.txt
+          pip --version
+          pip freeze
+    - task: PowerShell@2
+      displayName: Setup DevOpsFeedName
+      inputs:
+        targetType: inline
+        script: >
+          # For safety default to publishing to the private feed.
+
+          # Publish to https://dev.azure.com/azure-sdk/internal/_packaging?_a=feed&feed=azure-sdk-for-python-pr
+
+          $devopsFeedName = 'internal/azure-sdk-for-python-pr'
+
+          if ('$(Build.Repository.Name)' -eq 'Azure/azure-sdk-for-python') {
+            # Publish to https://dev.azure.com/azure-sdk/public/_packaging?_a=feed&feed=azure-sdk-for-python
+            $devopsFeedName = 'public/azure-sdk-for-python'
+          }
+
+          echo "##vso[task.setvariable variable=DevFeedName]$devopsFeedName"
+
+          echo "Using DevopsFeed = $devopsFeedName"
+        pwsh: true
+    - task: TwineAuthenticate@0
+      displayName: 'Twine Authenticate to feed'
+      inputs:
+        artifactFeeds: $(DevFeedName)
+    - task: PipAuthenticate@1
+      displayName: 'Pip Authenticate to feed'
+      inputs:
+        artifactFeeds: $(DevFeedName)
+        onlyAddExtraIndex: true
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifactName: packages
+        targetPath: $(Build.ArtifactStagingDirectory)
+    - task: Powershell@2
+      inputs:
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/Save-Package-Properties.ps1
+        arguments: >
+          -ServiceDirectory template -OutDirectory $(Build.ArtifactStagingDirectory)/PackageInfo
+        pwsh: true
+        workingDirectory: $(Pipeline.Workspace)
+      displayName: Dump Package properties
+      condition: succeeded()
+    - task: PowerShell@2
+      displayName: "Setup Versioning Properties"
+      condition: eq(variables['SetDevVersion'], '')
+      inputs:
+        targetType: inline
+        script: |
+          $setDailyDevBuild = "false"
+          if (('$(Build.Reason)' -eq 'Schedule') -and ('$(System.TeamProject)' -eq 'internal')) {
+            $setDailyDevBuild = "true"
+          }
+          echo "##vso[task.setvariable variable=SetDevVersion]$setDailyDevBuild"
+        pwsh: true
+    - task: PythonScript@0
+      condition: and(succeededOrFailed(), eq(variables['SetDevVersion'],'true'))
+      displayName: "Update package versions for dev build"
+      inputs:
+        scriptPath: 'eng/versioning/version_set_dev.py'
+        arguments: '"$(BuildTargetingStringValue)" --service="template" --build-id="$(Build.BuildNumber)"'
+    - task: PythonScript@0
+      displayName: 'Run Tests'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)" --wheel_dir="$(Build.ArtifactStagingDirectory)" $(CoverageArg) --mark_arg="" --service="template" --toxenv="$(toxenv)" --injected-packages="$(InjectedPackages)" --tenvparallel'
+      env: {}
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Tox Logs
+      condition: failed()
+      continueOnError: true
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/_tox_logs'
+        artifactType: 'pipeline'
+    - task: PowerShell@2
+      displayName: 'Show .coverage files'
+      condition: and(succeeded(), ne(variables['CoverageArg'], '--disablecov'))
+      inputs:
+        targetType: inline
+        script: |
+          if (Test-Path -Path '.\_coverage\') {
+            Get-ChildItem .\_coverage\ -Recurse |
+            Foreach-Object {
+              Get-Content $_
+            }
+          }
+        pwsh: true
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish .coverage files'
+      continueOnError: true
+      condition: and(succeeded(), ne(variables['CoverageArg'], '--disablecov'))
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/_coverage'
+        artifactType: 'pipeline'
+    - task: PublishTestResults@2
+      condition: always()
+      inputs:
+        testResultsFiles: '**/*test*.xml'
+        testRunTitle: template  $(Agent.JobName)
+        failTaskOnFailedTests: true
+    - task: PythonScript@0
+      displayName: 'Test Samples'
+      condition: and(succeeded(), eq(variables['TestSamples'], 'true'))
+      inputs:
+        scriptPath: 'scripts/devops_tasks/setup_execute_tests.py'
+        arguments: '"$(BuildTargetingStringValue)" --service="template" --toxenv="samples"'
+      env: {}
+  - job: 'RunRegression'
+    condition: and(succeededOrFailed(), or(eq(variables['Run.Regression'], 'true'), and(eq(variables['Build.Reason'], 'Schedule'), eq(variables['System.TeamProject'],'internal'))))
+    displayName: 'Run Regression'
+    timeoutInMinutes: 180
+    variables:
+    - name: PythonVersion
+      value: '3.6'
+    - name: skipComponentGovernanceDetection
+      value: true
+    - name: AzureSDKCondaChannel
+      value: https://azuresdkconda.blob.core.windows.net/channel1/
+    dependsOn:
+    - 'Build'
+    pool:
+      name: azsdk-pool-mms-ubuntu-2004-general
+      vmImage: MMSUbuntu20.04
+    steps:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.7'
+      inputs:
+        versionSpec: '3.7'
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifactName: 'packages'
+        targetPath: $(Build.ArtifactStagingDirectory)
+    - task: CmdLine@2
+      displayName: 'Prep Environment'
+      inputs:
+        script: |
+          pip install -r eng/regression_tools.txt
+    - task: Powershell@2
+      inputs:
+        filePath: $(Build.SourcesDirectory)/eng/common/scripts/Save-Package-Properties.ps1
+        arguments: >
+          -ServiceDirectory template -OutDirectory $(Build.ArtifactStagingDirectory)/PackageInfo
+        pwsh: true
+        workingDirectory: $(Pipeline.Workspace)
+      displayName: Dump Package properties
+      condition: succeeded()
+    - task: PowerShell@2
+      displayName: "Setup Versioning Properties"
+      condition: eq(variables['SetDevVersion'], '')
+      inputs:
+        targetType: inline
+        script: |
+          $setDailyDevBuild = "false"
+          if (('$(Build.Reason)' -eq 'Schedule') -and ('$(System.TeamProject)' -eq 'internal')) {
+            $setDailyDevBuild = "true"
+          }
+          echo "##vso[task.setvariable variable=SetDevVersion]$setDailyDevBuild"
+        pwsh: true
+    - task: PythonScript@0
+      condition: and(succeededOrFailed(), eq(variables['SetDevVersion'],'true'))
+      displayName: "Update package versions for dev build"
+      inputs:
+        scriptPath: 'eng/versioning/version_set_dev.py'
+        arguments: '"$(BuildTargetingStringValue)" --service="template" --build-id="$(Build.BuildNumber)"'
+    - task: PowerShell@2
+      displayName: Setup DevOpsFeedName
+      inputs:
+        targetType: inline
+        script: >
+          # For safety default to publishing to the private feed.
+
+          # Publish to https://dev.azure.com/azure-sdk/internal/_packaging?_a=feed&feed=azure-sdk-for-python-pr
+
+          $devopsFeedName = 'internal/azure-sdk-for-python-pr'
+
+          if ('$(Build.Repository.Name)' -eq 'Azure/azure-sdk-for-python') {
+            # Publish to https://dev.azure.com/azure-sdk/public/_packaging?_a=feed&feed=azure-sdk-for-python
+            $devopsFeedName = 'public/azure-sdk-for-python'
+          }
+
+          echo "##vso[task.setvariable variable=DevFeedName]$devopsFeedName"
+
+          echo "Using DevopsFeed = $devopsFeedName"
+        pwsh: true
+    - task: TwineAuthenticate@0
+      displayName: 'Twine Authenticate to feed'
+      inputs:
+        artifactFeeds: $(DevFeedName)
+    - task: PipAuthenticate@1
+      displayName: 'Pip Authenticate to feed'
+      inputs:
+        artifactFeeds: $(DevFeedName)
+        onlyAddExtraIndex: true
+    - task: PythonScript@0
+      displayName: 'Test Latest Released Dependents'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/test_regression.py'
+        arguments: '"$(BuildTargetingStringValue)" --service="template" --whl-dir="$(Build.ArtifactStagingDirectory)" --mark-arg="not cosmosEmulator"'
+    - task: PythonScript@0
+      displayName: 'Test Oldest Released Dependents'
+      inputs:
+        scriptPath: 'scripts/devops_tasks/test_regression.py'
+        arguments: '"$(BuildTargetingStringValue)" --service="template" --whl-dir="$(Build.ArtifactStagingDirectory)" --verify-latest=False --mark-arg="not cosmosEmulator"'
+- stage: Release_azuretemplate
+  displayName: 'Release: azure-template'
+  dependsOn:
+  - Build
+  condition: and(succeeded(), ne(variables['SetDevVersion'], 'true'), ne(variables['Skip.Release'], 'true'), ne(variables['Build.Repository.Name'], 'Azure/azure-sdk-for-python-pr'))
+  jobs:
+  - deployment: TagRepository
+    displayName: "Create release tag"
+    condition: ne(variables['Skip.TagRepository'], 'true')
+    environment:
+      name: github
+    pool:
+      name: azsdk-pool-mms-ubuntu-1804-general
+      vmImage: MMSUbuntu20.04
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            inputs:
+              repository: self
+          - task: PowerShell@2
+            displayName: Retain pipeline run
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            inputs:
+              pwsh: true
+              filePath: $(Build.SourcesDirectory)/eng/common/scripts/Add-RetentionLease.ps1
+              arguments: -Organization azure-sdk -Project $(System.TeamProject) -DefinitionId $(System.DefinitionId) -RunId $(Build.BuildId) -OwnerId Pipeline -DaysValid 365 -AccessToken $env:SYSTEM_ACCESSTOKEN -Debug
+          - task: PowerShell@2
+            displayName: Prep template pipeline for release
+            condition: succeeded()
+            inputs:
+              pwsh: true
+              workingDirectory: $(Build.SourcesDirectory)
+              filePath: $(Build.SourcesDirectory)/eng/common/scripts/SetTestPipelineVersion.ps1
+              arguments: -BuildID $(Build.BuildId) -PackageName azure-template -ServiceDirectory template
+          - task: Powershell@2
+            inputs:
+              filePath: $(Build.SourcesDirectory)/eng/common/scripts/Verify-ChangeLog.ps1
+              arguments: >
+                -PackageName azure-template -ServiceDirectory template -ForRelease $True
+              pwsh: true
+              workingDirectory: $(Pipeline.Workspace)
+            displayName: Verify ChangeLogEntry for azure-template
+            continueOnError: false
+          - task: PowerShell@2
+            displayName: Output Visible Artifacts
+            inputs:
+              targetType: inline
+              script: >
+                Get-ChildItem -Recurse $(Pipeline.Workspace)/packages/azure-template
+              pwsh: true
+              workingDirectory: $(Pipeline.Workspace)
+          - task: PowerShell@2
+            displayName: 'Verify Package Tags and Create Git Releases'
+            inputs:
+              filePath: eng/common/scripts/create-tags-and-git-release.ps1
+              arguments: >
+                -artifactLocation $(Pipeline.Workspace)/packages/azure-template -packageRepository PyPI -releaseSha $(Build.SourceVersion) -repoId Azure/azure-sdk-for-python -workingDirectory '$(System.DefaultWorkingDirectory)'
+              pwsh: true
+            timeoutInMinutes: 5
+            env:
+              GH_TOKEN: $(azuresdk-github-pat)
+  - deployment: PublishPackage
+    displayName: "Publish to PyPI"
+    condition: and(succeeded(), ne(variables['Skip.PublishPackage'], 'true'))
+    environment:
+      name: pypi
+    dependsOn:
+    - TagRepository
+    pool:
+      name: azsdk-pool-mms-ubuntu-1804-general
+      vmImage: MMSUbuntu20.04
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            condition: false
+            inputs:
+              repository: none
+          - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+            timeoutInMinutes: 5
+            inputs:
+              alias: current
+              artifact: packages
+          - task: UsePythonVersion@0
+          - task: CmdLine@2
+            displayName: Install Twine
+            inputs:
+              script: |
+                set -e
+                pip install twine readme-renderer[md]
+          - task: TwineAuthenticate@1
+            displayName: 'Authenticate to registry: pypi.org'
+            inputs:
+              pythonUploadServiceConnection: 'pypi.org - azure-sdk'
+          - task: TwineAuthenticate@0
+            displayName: 'Authenticate to feed: public/azure-sdk-for-python'
+            inputs:
+              artifactFeeds: public/azure-sdk-for-python
+          - task: CmdLine@2
+            displayName: 'Publish package to registry: pypi.org'
+            inputs:
+              script: >
+                set -e
+
+                twine upload --repository 'pypi' --config-file $(PYPIRC_PATH) $(Pipeline.Workspace)/packages/azure-template/*.whl
+
+                echo "Uploaded whl to pypi"
+
+                twine upload --repository 'pypi' --config-file $(PYPIRC_PATH) $(Pipeline.Workspace)/packages/azure-template/*.zip
+
+                echo "Uploaded zip to pypi"
+          - task: CmdLine@2
+            displayName: 'Publish package to feed: public/azure-sdk-for-python'
+            inputs:
+              script: >
+                set -e
+
+                twine upload --repository public/azure-sdk-for-python --config-file $(PYPIRC_PATH) $(Pipeline.Workspace)/packages/azure-template/*.whl
+
+                echo "Uploaded whl to devops feed"
+
+                twine upload --repository public/azure-sdk-for-python --config-file $(PYPIRC_PATH) $(Pipeline.Workspace)/packages/azure-template/*.zip
+
+                echo "Uploaded sdist to devops feed"
+  - deployment: PublishGitHubIODocs
+    displayName: Publish Docs to GitHubIO Blob Storage
+    condition: and(succeeded(), ne(variables['Skip.PublishDocs'], 'true'))
+    environment:
+      name: githubio
+    dependsOn:
+    - PublishPackage
+    pool:
+      name: azsdk-pool-mms-win-2019-general
+      vmImage: MMS2019
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            inputs:
+              repository: self
+          - task: PowerShell@2
+            displayName: Output Visible Artifacts
+            inputs:
+              targetType: inline
+              script: >
+                Get-ChildItem -Recurse $(Pipeline.Workspace)/documentation/azure-template
+              pwsh: true
+              workingDirectory: $(Pipeline.Workspace)
+          - task: PowerShell@2
+            displayName: "Setup Default Branch"
+            inputs:
+              targetType: inline
+              script: >
+                $setDefaultBranch = (git remote show origin | Out-String) -replace "(?ms).*HEAD branch: (\w+).*", '$1'
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "Not able to fetch the default branch from git command. Set to main."
+                  $setDefaultBranch = 'main'
+                }
+
+                Write-Host "Setting DefaultBranch=$setDefaultBranch"
+
+                Write-Host "##vso[task.setvariable variable=DefaultBranch]$setDefaultBranch"
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              ignoreLASTEXITCODE: true
+          - task: PowerShell@2
+            displayName: Download and Extract azcopy Zip
+            inputs:
+              targetType: inline
+              script: |
+                Invoke-WebRequest -MaximumRetryCount 10 -Uri "https://aka.ms/downloadazcopy-v10-windows" -OutFile "azcopy.zip" | Wait-Process;
+                Expand-Archive -Path "azcopy.zip" -DestinationPath "$(Build.BinariesDirectory)/azcopy/"
+              pwsh: true
+              workingDirectory: $(Build.BinariesDirectory)
+          - task: Powershell@2
+            inputs:
+              filePath: eng/common/scripts/copy-docs-to-blobstorage.ps1
+              arguments: >
+                -AzCopy $(Resolve-Path "$(Build.BinariesDirectory)/azcopy/azcopy_windows_amd64_*/azcopy.exe")[0] -DocLocation "$(Pipeline.Workspace)/documentation/azure-template" -SASKey "$(azure-sdk-docs-prod-sas)" -BlobName "$(azure-sdk-docs-prod-blob-name)" -PublicArtifactLocation "$(Pipeline.Workspace)/packages/azure-template" -RepoReplaceRegex "(https://github.com/$(Build.Repository.Name)/(?:blob|tree)/)$(DefaultBranch)"
+              pwsh: true
+              workingDirectory: $(Pipeline.Workspace)
+            displayName: Copy Docs to Blob
+            continueOnError: false
+  - deployment: PublishDocs
+    displayName: "Docs.MS Release"
+    condition: and(succeeded(), ne(variables['Skip.PublishDocs'], 'true'))
+    environment:
+      name: githubio
+    dependsOn:
+    - PublishPackage
+    pool:
+      name: azsdk-pool-mms-ubuntu-2004-general
+      vmImage: MMSUbuntu20.04
+    variables:
+    - name: CIConfigs
+      value: "{'targets':[{'path_to_config':'ci-configs/packages-preview.json','Mode':'Preview','content_folder':'docs-ref-services/preview'},{'path_to_config':'ci-configs/packages-latest.json','mode':'Latest','content_folder':'docs-ref-services/latest'}]}"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            inputs:
+              repository: self
+          - task: PowerShell@2
+            displayName: Output Visible Artifacts
+            inputs:
+              targetType: inline
+              script: >
+                Get-ChildItem -Recurse $(Pipeline.Workspace)/packages/azure-template
+              pwsh: true
+              workingDirectory: $(Pipeline.Workspace)
+          - task: PowerShell@2
+            displayName: Setup Identity Resolver
+            inputs:
+              targetType: inline
+              script: |
+                git clone https://github.com/Azure/azure-sdk-tools.git $(Build.SourcesDirectory)/tools_repo
+                cd $(Build.SourcesDirectory)/tools_repo
+                git checkout azure-sdk-tools_20210114.1
+              pwsh: true
+          - task: PowerShell@2
+            displayName: 'Resolving Queuing User'
+            continueOnError: true
+            env:
+              APP_ID: $(notification-aad-app-id)
+              APP_SECRET: $(notification-aad-secret)
+              AAD_TENANT: $(notification-aad-tenant)
+              KUSTO_URL: $(notification-kusto-url)
+              KUSTO_DB: $(notification-kusto-db)
+              KUSTO_TABLE: $(notification-kusto-table)
+            inputs:
+              targetType: inline
+              script: >
+                dotnet run -v q -- `
+                  --aad-app-id-var APP_ID `
+                  --aad-app-secret-var APP_SECRET `
+                  --aad-tenant-var AAD_TENANT `
+                  --kusto-url-var KUSTO_URL `
+                  --kusto-database-var KUSTO_DB `
+                  --kusto-table-var KUSTO_TABLE `
+                  --identity "$(Build.QueuedBy)" `
+                  --targetvar "OwningGHUser"
+              pwsh: true
+              workingDirectory: $(Build.SourcesDirectory)/tools_repo/tools/notification-configuration/identity-resolver
+          - task: PowerShell@2
+            displayName: Clean Up Cloned Tools Repo
+            inputs:
+              targetType: inline
+              script: |
+                Remove-Item -Force -Recurse $(Build.SourcesDirectory)/tools_repo
+              pwsh: true
+          - task: PowerShell@2
+            displayName: Add CodeOwners if Present
+            inputs:
+              pwsh: true
+              filePath: $(Build.SourcesDirectory)/eng/common/scripts/get-codeowners.ps1
+              arguments: -TargetDirectory "/sdk/template/" -RootDirectory "$(Build.SourcesDirectory)" -VsoVariable "OwningGHUser"
+          - task: PowerShell@2
+            displayName: Enable Long Paths if Necessary
+            inputs:
+              targetType: inline
+              script: |
+                if ($IsWindows) {
+                  REG ADD HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FileSystem /f /v LongPathsEnabled /t REG_DWORD /d 1
+                  git config --system core.longpaths true
+                }
+                else {
+                  Write-Host "This script is not executing on Windows, skipping registry modification."
+                }
+              pwsh: true
+          - task: PowerShell@2
+            displayName: Clone Documentation Repository
+            inputs:
+              targetType: inline
+              script: >
+                git clone https://github.com/MicrosoftDocs/azure-docs-sdk-python $(System.DefaultWorkingDirectory)/repo
+              pwsh: true
+              ignoreLASTEXITCODE: false
+          - task: PowerShell@2
+            displayName: "Setup Default Branch"
+            inputs:
+              targetType: inline
+              script: >
+                $setDefaultBranch = (git remote show origin | Out-String) -replace "(?ms).*HEAD branch: (\w+).*", '$1'
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "Not able to fetch the default branch from git command. Set to main."
+                  $setDefaultBranch = 'main'
+                }
+
+                Write-Host "Setting DefaultBranch=$setDefaultBranch"
+
+                Write-Host "##vso[task.setvariable variable=DefaultBranch]$setDefaultBranch"
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)/repo
+              ignoreLASTEXITCODE: true
+          - task: PowerShell@2
+            displayName: 'Apply Documentation Updates From Artifact'
+            inputs:
+              targetType: filePath
+              filePath: eng/common/scripts/update-docs-metadata.ps1
+              arguments: >
+                -ArtifactLocation $(Pipeline.Workspace)/packages/azure-template -Repository PyPI -ReleaseSHA $(Build.SourceVersion) -RepoId Azure/azure-sdk-for-python -WorkDirectory "$(System.DefaultWorkingDirectory)" -DocRepoLocation "$(System.DefaultWorkingDirectory)/repo" -Language "python" -Configs "$(CIConfigs)"
+              pwsh: true
+            env:
+              GH_TOKEN: $(azuresdk-github-pat)
+          - task: PowerShell@2
+            displayName: Check for changes
+            condition: and(succeeded(), eq(false, false))
+            inputs:
+              targetType: inline
+              script: |
+                echo "git add -A"
+                git add -A
+
+                echo "git diff --name-status --cached --exit-code"
+                git diff --name-status --cached --exit-code
+
+                if ($LastExitCode -ne 0) {
+                  echo "##vso[task.setvariable variable=HasChanges]$true"
+                  echo "Changes detected so setting HasChanges=true"
+                }
+                else {
+                  echo "##vso[task.setvariable variable=HasChanges]$false"
+                  echo "No changes so skipping code push"
+                }
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)/repo
+              ignoreLASTEXITCODE: true
+          - task: PowerShell@2
+            displayName: Remove Repo Owner from Repo Name
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: >
+                # Remove the repo owner from the front of the repo name if it exists there
+
+                $repoName = "azure-docs-sdk-python" -replace "^MicrosoftDocs/", ""
+
+                echo "##vso[task.setvariable variable=RepoNameWithoutOwner]$repoName"
+
+                echo "RepoName = $repoName"
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)/repo
+          - task: PowerShell@2
+            displayName: Push changes
+            condition: and(succeeded(), eq(variables['HasChanges'], 'true'))
+            inputs:
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)/repo
+              filePath: $(System.DefaultWorkingDirectory)/eng/common/scripts/git-branch-push.ps1
+              arguments: >
+                -PRBranchName "$(DefaultBranch)" -CommitMsg "Update docs metadata and targeting for release of azure-template" -GitUrl "https://$(azuresdk-github-pat)@github.com/MicrosoftDocs/$(RepoNameWithoutOwner).git" -PushArgs "" -SkipCommit $false
+  - deployment: UpdatePackageVersion
+    displayName: "Update Package Version"
+    condition: and(succeeded(), ne(variables['Skip.UpdatePackageVersion'], 'true'))
+    environment:
+      name: github
+    dependsOn:
+    - PublishPackage
+    pool:
+      name: azsdk-pool-mms-ubuntu-2004-general
+      vmImage: MMSUbuntu20.04
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+            inputs:
+              repository: self
+          - task: UsePythonVersion@0
+          - task: CmdLine@2
+            displayName: Install versioning tool dependencies
+            inputs:
+              script: |
+                pip install -r ./eng/versioning/requirements.txt
+          - task: PythonScript@0
+            displayName: Increment package version
+            inputs:
+              scriptPath: 'eng/versioning/version_increment.py'
+              arguments: --package-name azure-template --service template
+          - task: PowerShell@2
+            displayName: Check for changes
+            condition: and(succeeded(), eq(false, false))
+            inputs:
+              targetType: inline
+              script: |
+                echo "git add -A"
+                git add -A
+
+                echo "git diff --name-status --cached --exit-code"
+                git diff --name-status --cached --exit-code
+
+                if ($LastExitCode -ne 0) {
+                  echo "##vso[task.setvariable variable=HasChanges]$true"
+                  echo "Changes detected so setting HasChanges=true"
+                }
+                else {
+                  echo "##vso[task.setvariable variable=HasChanges]$false"
+                  echo "No changes so skipping code push"
+                }
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              ignoreLASTEXITCODE: true
+          - task: PowerShell@2
+            displayName: Remove Repo Owner from Repo Name
+            condition: succeeded()
+            inputs:
+              targetType: inline
+              script: >
+                # Remove the repo owner from the front of the repo name if it exists there
+
+                $repoName = "azure-sdk-for-python" -replace "^Azure/", ""
+
+                echo "##vso[task.setvariable variable=RepoNameWithoutOwner]$repoName"
+
+                echo "RepoName = $repoName"
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)
+          - task: PowerShell@2
+            displayName: Push changes
+            condition: and(succeeded(), eq(variables['HasChanges'], 'true'))
+            inputs:
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              filePath: eng/common/scripts/git-branch-push.ps1
+              arguments: >
+                -PRBranchName "increment-package-version-template-$(Build.BuildId)" -CommitMsg "Increment package version after release of azure-template" -GitUrl "https://$(azuresdk-github-pat)@github.com/azure-sdk/$(RepoNameWithoutOwner).git" -PushArgs "" -SkipCommit $false
+          - task: PowerShell@2
+            displayName: Create pull request
+            condition: and(succeeded(), eq(variables['HasChanges'], 'true'))
+            inputs:
+              pwsh: true
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              filePath: eng/common/scripts/Submit-PullRequest.ps1
+              arguments: >
+                -RepoOwner "Azure" -RepoName "$(RepoNameWithoutOwner)" -BaseBranch "$(Build.SourceBranch)" -PROwner "azure-sdk" -PRBranch "increment-package-version-template-$(Build.BuildId)" -AuthToken "$(azuresdk-github-pat)" -PRTitle "Increment version for template releases" -PRBody "Increment package version after release of azure-template" -PRLabels "auto-merge" -UserReviewers "$()" -TeamReviewers "$()" -Assignees "$()" -CloseAfterOpenForTesting $true -OpenAsDraft $false
+  - job: smoke_test_eligibility
+    displayName: Check Smoke Test Eligibility
+    pool:
+      name: "azsdk-pool-mms-ubuntu-2004-general"
+      vmImage: "MMSUbuntu20.04"
+    steps:
+    - task: PowerShell@2
+      name: check_smoke_tests_azuretemplate
+      displayName: Check smoke test eligibility for azure-template
+      inputs:
+        targetType: inline
+        script: >
+          $packages = Get-Content $(Build.SourcesDirectory)/common/smoketest/requirements-release.txt
+
+          if ($packages | Where-Object { $_ -match "azure-template" }) {
+            Write-Host "Smoke tests will run for azure-template"
+            Write-Host "##vso[task.setvariable variable=RunSmokeTests;]true"
+          }
+        pwsh: true
+    - task: PowerShell@2
+      name: output_eligibility
+      env:
+        RunSmokeTests: $(RunSmokeTests)
+      inputs:
+        targetType: inline
+        script: |
+          Write-Host "Setting RunSmokeTests to $($env:RunSmokeTests)"
+          Write-Host "##vso[task.setvariable variable=RunSmokeTests;isOutput=true;]$($env:RunSmokeTests)"
+        pwsh: true
+  - job: run_smoke_test
+    displayName: Run Smoke Test
+    dependsOn:
+    - smoke_test_eligibility
+    condition: and(succeeded(), eq(dependencies.smoke_test_eligibility.outputs['output_eligibility.RunSmokeTests'], true))
+    strategy:
+      matrix:
+        Python_38_Linux (AzureCloud):
+          PythonVersion: '3.8'
+          Pool: "azsdk-pool-mms-ubuntu-2004-general"
+          OSVmImage: "MMSUbuntu20.04"
+          SubscriptionConfiguration: $(sub-config-azure-cloud-test-resources)
+          ArmTemplateParameters: $(azureCloudArmParameters)
+    pool:
+      name: $(Pool)
+      vmImage: $(OSVmImage)
+    variables:
+    - name: PythonVersion
+      value: '3.6'
+    - name: skipComponentGovernanceDetection
+      value: true
+    - name: AzureSDKCondaChannel
+      value: https://azuresdkconda.blob.core.windows.net/channel1/
+    - name: Location
+      value: ''
+    - name: azureCloudArmParameters
+      value: "@{ storageEndpointSuffix = 'core.windows.net'; azureCloud = 'AzureCloud'; }"
+    - name: azureUSGovernmentArmParameters
+      value: "@{ storageEndpointSuffix = 'core.usgovcloudapi.net'; azureCloud = 'AzureUSGovernment'; }"
+    - name: azureChinaCloudArmParameters
+      value: "@{ storageEndpointSuffix = 'core.chinacloudapi.cn'; azureCloud = 'AzureChinaCloud'; }"
+    - name: requirements
+      value: $(Build.SourcesDirectory)/common/smoketest/requirements-release.txt
+    steps:
+    - task: PowerShell@2
+      displayName: Verify agent OS
+      inputs:
+        pwsh: true
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        filePath: eng/common/scripts/Verify-AgentOS.ps1
+        arguments: >
+          -AgentImage "$(OSVmImage)"
+    - task: CmdLine@2
+      displayName: Bypass local DNS server to workaround issue resolving cognitiveservices names
+      condition: |
+        and(
+          succeededOrFailed(),
+          contains(variables['OSVmImage'], 'ubuntu'),
+          eq(variables['Container'], '')
+        )
+      inputs:
+        script: sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+    - task: UsePythonVersion@0
+      displayName: "Use Python $(PythonVersion)"
+      inputs:
+        versionSpec: $(PythonVersion)
+    - task: CmdLine@2
+      displayName: pip --version
+      inputs:
+        script: |
+          python -m pip install pip==20.0.2
+          pip --version
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      timeoutInMinutes: 5
+      inputs:
+        alias: current
+        artifact: packages
+    - task: PowerShell@2
+      displayName: Override requirements with pipeline build artifact versions
+      env:
+        REQUIREMENTS: $(requirements)
+      inputs:
+        targetType: inline
+        script: >
+          $packages = Get-ChildItem "$(Pipeline.Workspace)/packages/*/*.zip"
+
+          Write-Host "Artifacts found:"
+
+          $artifacts = $packages | ForEach-Object {
+            if ($_.Name -match "([a-zA-Z\-]+)\-(.*).zip") {
+              Write-Host "$($matches[1]): $($matches[2])"
+              return @{ "name" = $matches[1]; "version" = $matches[2] }
+            }
+          }
+
+          $dependencies = Get-Content $env:REQUIREMENTS | ForEach-Object {
+            $line = $_
+            if ($line -match "([a-zA-Z\-]+)(\W+)(.*)") {
+                $override = ($artifacts | Where-Object { $_.Name -eq $matches[1] }).Version
+                if ($override) {
+                    $line = $line -replace '([a-zA-Z\-]+)(\W+)(.*)', ('${1}${2}' + $override)
+                    Write-Host "Overriding dependency to: $line"
+                }
+            }
+            return $line
+          }
+
+
+          $dependencies | Out-File $env:REQUIREMENTS
+        pwsh: true
+    - task: PowerShell@2
+      displayName: Install requirements without dependencies
+      env:
+        REQUIREMENTS: $(requirements)
+      inputs:
+        targetType: inline
+        script: |
+          $timeout = New-TimeSpan -Seconds 600
+          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+          do {
+            $failure = $false
+            try {
+              pip --retries 10 install -r "$env:REQUIREMENTS" --no-deps --upgrade --no-cache-dir
+            } catch {
+              $failure = $true
+              Write-Host "Installation failed, retrying in 3 minutes..."
+              sleep 180
+            }
+          } while (($stopwatch.elapsed -lt $timeout) -and ($failure))
+        pwsh: true
+    - task: PowerShell@2
+      displayName: "Install requirements_async.txt"
+      condition: and(succeeded(), ne(variables['SkipAsyncInstall'], true))
+      inputs:
+        targetType: inline
+        script: pip install -r $(Build.SourcesDirectory)/common/smoketest/requirements_async.txt
+        pwsh: true
+    - task: PowerShell@2
+      displayName: Create dependency list from installed packages
+      env:
+        REQUIREMENTS: $(requirements)
+      inputs:
+        targetType: inline
+        script: |
+          python $(Build.SourcesDirectory)/common/smoketest/dependencies.py -r "$env:REQUIREMENTS" `
+            | Out-File $(Build.SourcesDirectory)/common/smoketest/requirements_dependencies.txt
+        pwsh: true
+    - task: CmdLine@2
+      displayName: Install package dependencies from PyPI
+      inputs:
+        script: pip install -r $(Build.SourcesDirectory)/common/smoketest/requirements_dependencies.txt
+    - task: CmdLine@2
+      displayName: Show installed packages (pip freeze)
+      inputs:
+        script: pip freeze
+    - task: PowerShell@2
+      displayName: Set PS Modules Cache Directory
+      inputs:
+        targetType: inline
+        script: |
+          . ./eng/common/scripts/Helpers/PSModule-Helpers.ps1
+          Write-Host "##vso[task.setvariable variable=CachedPSModulePath]$global:CurrentUserModulePath"
+        pwsh: true
+    - task: Cache@2
+      inputs:
+        key: 'PSModulePath | $(CacheSalt) | $(Agent.OS) | $(Build.SourcesDirectory)/eng/common/scripts/Import-AzModules.ps1'
+        path: $(CachedPSModulePath)
+      displayName: Cache PS Modules
+    - task: Bash@3
+      displayName: (MacOS) Grant access to ~/.Azure
+      condition: contains(variables['OSVmImage'], 'mac')
+      inputs:
+        targetType: inline
+        script: sudo chown -R runner ~/.Azure
+    - task: Powershell@2
+      displayName: Register Dogfood environment
+      inputs:
+        targetType: inline
+        pwsh: true
+        script: |
+          eng/common/scripts/Import-AzModules.ps1
+
+          $environmentSpec = @"
+            $(env-config-dogfood)
+          "@ | ConvertFrom-Json -AsHashtable;
+          Add-AzEnvironment @environmentSpec
+    - task: PowerShell@2
+      displayName: Deploy test resources
+      env:
+        TEMP: $(Agent.TempDirectory)
+      inputs:
+        targetType: inline
+        script: >
+          eng/common/scripts/Import-AzModules.ps1
+
+
+          $subscriptionConfiguration = @'
+            $(SubscriptionConfiguration)
+          '@ | ConvertFrom-Json -AsHashtable;
+
+
+          # The subscriptionConfiguration may have ArmTemplateParameters defined, so
+
+          # pass those in via the ArmTemplateParameters flag, and handle any
+
+          # additional parameters from the pipelines via AdditionalParameters
+
+          eng/common/TestResources/New-TestResources.ps1 `
+            -BaseName 'Generated' `
+            -ServiceDirectory '$(Build.SourcesDirectory)/common/smoketest/' `
+            -Location '$(Location)' `
+            -DeleteAfterHours '8' `
+            @subscriptionConfiguration `
+            -AdditionalParameters $(ArmTemplateParameters) `
+            -CI `
+            -Force `
+            -Verbose | Out-Null
+        pwsh: true
+    - task: CmdLine@2
+      displayName: Run Smoke Test
+      inputs:
+        script: python $(Build.SourcesDirectory)/common/smoketest/program.py
+    - task: PowerShell@2
+      displayName: Remove test resources
+      condition: ne(variables['AZURE_RESOURCEGROUP_NAME'], '')
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: >
+          eng/common/scripts/Import-AzModules.ps1
+
+
+          $subscriptionConfiguration = @"
+            $(SubscriptionConfiguration)
+          "@ | ConvertFrom-Json -AsHashtable;
+
+
+          eng/common/TestResources/Remove-TestResources.ps1 `
+            -ResourceGroupName "${env:AZURE_RESOURCEGROUP_NAME}" `
+            -ServiceDirectory "$(Build.SourcesDirectory)/common/smoketest/" `
+            @subscriptionConfiguration `
+            -Force `
+            -Verbose
+        pwsh: true
+- stage: Integration
+  dependsOn:
+  - Build
+  condition: succeededOrFailed('Build')
+  jobs:
+  - job: PublishPackages
+    displayName: "Publish package to daily feed"
+    condition: or(eq(variables['SetDevVersion'], 'true'), and(eq(variables['Build.Reason'],'Schedule'), eq(variables['System.TeamProject'], 'internal')))
+    pool:
+      name: azsdk-pool-mms-ubuntu-1804-general
+      vmImage: MMSUbuntu20.04
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      condition: false
+      inputs:
+        repository: none
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      timeoutInMinutes: 5
+      inputs:
+        alias: current
+        artifact: packages
+    - task: UsePythonVersion@0
+    - task: CmdLine@2
+      displayName: Install Twine
+      inputs:
+        script: |
+          set -e
+          pip install twine
+    - task: PowerShell@2
+      displayName: Setup DevOpsFeedName
+      inputs:
+        targetType: inline
+        script: >
+          # For safety default to publishing to the private feed.
+
+          # Publish to https://dev.azure.com/azure-sdk/internal/_packaging?_a=feed&feed=azure-sdk-for-python-pr
+
+          $devopsFeedName = 'internal/azure-sdk-for-python-pr'
+
+          if ('$(Build.Repository.Name)' -eq 'Azure/azure-sdk-for-python') {
+            # Publish to https://dev.azure.com/azure-sdk/public/_packaging?_a=feed&feed=azure-sdk-for-python
+            $devopsFeedName = 'public/azure-sdk-for-python'
+          }
+
+          echo "##vso[task.setvariable variable=DevFeedName]$devopsFeedName"
+
+          echo "Using DevopsFeed = $devopsFeedName"
+        pwsh: true
+    - task: TwineAuthenticate@0
+      displayName: 'Twine Authenticate to feed'
+      inputs:
+        artifactFeeds: $(DevFeedName)
+    - task: PipAuthenticate@1
+      displayName: 'Pip Authenticate to feed'
+      inputs:
+        artifactFeeds: $(DevFeedName)
+        onlyAddExtraIndex: true
+    - task: PowerShell@2
+      displayName: Publish azure-template alpha package
+      inputs:
+        targetType: inline
+        script: >
+          $fileCount = (Get-ChildItem $(Pipeline.Workspace)/packages/azure-template | ? {$_.Name -match "-[0-9]*.[0-9]*.[0-9]*a[0-9]*" } | Measure-Object).Count
+
+
+          if ($fileCount -eq 0) {
+            Write-Host "No alpha packages for azuretemplate to publish."
+            exit 0
+          }
+
+
+          twine upload --repository $(DevFeedName) --config-file $(PYPIRC_PATH) $(Pipeline.Workspace)/packages/azure-template/*-*a*.whl
+
+          echo "Uploaded whl to devops feed $(DevFeedName)"
+
+          twine upload --repository $(DevFeedName) --config-file $(PYPIRC_PATH) $(Pipeline.Workspace)/packages/azure-template/*-*a*.zip
+
+          echo "Uploaded sdist to devops feed $(DevFeedName)"
+        pwsh: true
+
+

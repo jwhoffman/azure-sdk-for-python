@@ -224,7 +224,7 @@ stages:
                           CloseAfterOpenForTesting: '${{ parameters.TestPipeline }}'
           - ${{if and(eq(variables['Build.Reason'], 'Manual'), eq(variables['System.TeamProject'], 'internal'))}}:
             - template: /eng/pipelines/templates/jobs/smoke.tests.yml
-              ${{ if eq(parameters.Daily, false) }}:
+              ${{if ne(artifact.skipPublishPackage, 'true')}}:
                 dependsOn: PublishPackage
               parameters:
                 Daily: false
